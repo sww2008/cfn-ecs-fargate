@@ -1,0 +1,393 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: CloudFormation template for ECS-Fargate.
+Parameters:
+  Image:
+    Type: String
+    Default: your ECR url
+  ServiceName:
+    Type: String
+    Default: MyService
+  ContainerPort:
+    Type: Number
+    Default: 80
+  LoadBalancerPort:
+    Type: Number
+    Default: 443
+  #Health check path in Load balancer TargetGroup
+  HealthCheckPath:
+    Type: String
+    Default: /healthcheck
+  HostedZoneName:
+    Type: String
+    Default: yourdomainname.com
+  BackendSubdomain:
+    Type: String
+    Default: backend
+  RDSSubdomain:
+    Type: String
+    Default: rds
+  MinContainers:
+    Type: Number
+    Default: 2
+  MaxContainers:
+    Type: Number
+    Default: 4
+  AutoScalingTargetValue:
+    Type: Number
+    Default: 60
+  Certificate:
+    Type: String
+Resources:
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref ServiceName
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn: LogGroup
+    Properties:
+      Family: !Join ['', [!Ref ServiceName, TaskDefinition]]
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      # 256 (.25 vCPU) - Available memory values: 0.5GB, 1GB, 2GB
+      # 512 (.5 vCPU) - Available memory values: 1GB, 2GB, 3GB, 4GB
+      # 1024 (1 vCPU) - Available memory values: 2GB, 3GB, 4GB, 5GB, 6GB, 7GB, 8GB
+      # 2048 (2 vCPU) - Available memory values: Between 4GB and 16GB in 1GB increments
+      # 4096 (4 vCPU) - Available memory values: Between 8GB and 30GB in 1GB increments
+      Cpu: 512
+      # 0.5GB, 1GB, 2GB - Available cpu values: 256 (.25 vCPU)
+      # 1GB, 2GB, 3GB, 4GB - Available cpu values: 512 (.5 vCPU)
+      # 2GB, 3GB, 4GB, 5GB, 6GB, 7GB, 8GB - Available cpu values: 1024 (1 vCPU)
+      # Between 4GB and 16GB in 1GB increments - Available cpu values: 2048 (2 vCPU)
+      # Between 8GB and 30GB in 1GB increments - Available cpu values: 4096 (4 vCPU)
+      Memory: 1GB
+      ExecutionRoleArn: !Ref ExecutionRole
+      TaskRoleArn: !Ref TaskRole
+      ContainerDefinitions:
+        - Name: !Ref ServiceName
+          Image: !Ref Image
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref LogGroup
+              awslogs-stream-prefix: ecs
+          Environment:
+            #DB endpoint url needed by backend 
+            - Name: SPRING_DATASOURCE_URL 
+              Value: !Join
+                - ''
+                - - 'jdbc:postgresql://'
+                  - !Join ['', [!Ref RDSSubdomain, ., !Ref HostedZoneName]]
+                  - !Join ['', [':5432/', !Ref 'AWS::StackName', db]]
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ['', [!Ref ServiceName, ExecutionRole]]
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ['', [!Ref ServiceName, TaskRole]]
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+  AutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ['', [!Ref ServiceName, AutoScalingRole]]
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceAutoscaleRole'
+  ContainerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Join
+        - '-'
+        - - !Ref 'AWS::StackName'
+          - private-container-sg
+      GroupDescription: !Join ['', [!Ref ServiceName, ContainerSecurityGroup]]
+      VpcId: !Ref ECSFargateVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Join
+        - '-'
+        - - !Ref 'AWS::StackName'
+          - public-alb-sg
+      GroupDescription: !Join ['', [!Ref ServiceName, LoadBalancerSecurityGroup]]
+      VpcId: !Ref ECSFargateVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref LoadBalancerPort
+          ToPort: !Ref LoadBalancerPort
+          CidrIp: 0.0.0.0/0
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ListenerHTTPS
+      - DBInstance
+    Properties: 
+      ServiceName: !Ref ServiceName
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+      DesiredCount: 2
+      HealthCheckGracePeriodSeconds: 120
+      LaunchType: FARGATE
+      NetworkConfiguration: 
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref ECSFargateSubnet1
+            - !Ref ECSFargateSubnet2
+          SecurityGroups:
+            - !Ref ContainerSecurityGroup
+      LoadBalancers:
+        - ContainerName: !Ref ServiceName
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref TargetGroup
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 60
+      HealthCheckPath: !Ref HealthCheckPath
+      HealthCheckTimeoutSeconds: 5
+      UnhealthyThresholdCount: 3
+      HealthyThresholdCount: 2
+      Name: !Join ['', [!Ref ServiceName, TargetGroup]]
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 60 # default is 300
+      TargetType: ip
+      VpcId: !Ref ECSFargateVPC
+  ListenerHTTPS:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: !Ref LoadBalancerPort
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref Certificate
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Join ['', [!Ref ServiceName, LoadBalancer]]
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      Subnets:
+        - !Ref ECSFargateSubnet1
+        - !Ref ECSFargateSubnet2
+  DNSRecordALB:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneName: !Join ['', [!Ref HostedZoneName, .]]
+      Name: !Join ['', [!Ref BackendSubdomain, ., !Ref HostedZoneName, .]]
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt LoadBalancer.DNSName
+        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+  DNSRecordRDS:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneName: !Join ['', [!Ref HostedZoneName, .]]
+      Name: !Join ['', [!Ref RDSSubdomain, ., !Ref HostedZoneName, .]]
+      Type: CNAME
+      TTL: '300'
+      ResourceRecords:
+        - !GetAtt DBInstance.Endpoint.Address
+    DependsOn: DBInstance  
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', [/ecs/, !Ref ServiceName, TaskDefinition]]
+  AutoScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MinCapacity: !Ref MinContainers
+      MaxCapacity: !Ref MaxContainers
+      ResourceId: !Join ['/', [service, !Ref Cluster, !GetAtt Service.Name]]
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+      RoleARN: !GetAtt AutoScalingRole.Arn
+  AutoScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Join ['', [!Ref ServiceName, AutoScalingPolicy]]
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref AutoScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleInCooldown: 200
+        ScaleOutCooldown: 200
+        TargetValue: !Ref AutoScalingTargetValue
+  DBInstance:
+    Type: 'AWS::RDS::DBInstance'
+    Properties:
+      DBName: !Join
+        - ''
+        - - !Ref 'AWS::StackName'
+          - db
+      Engine: postgres
+      EngineVersion: '13.3'
+      MasterUsername: master
+      DBInstanceClass: db.t3.micro
+      VPCSecurityGroups:
+        - !GetAtt DBSecurityGroup.GroupId
+      AllocatedStorage: '20'
+      MasterUserPassword: postgres
+      MultiAZ: 'false'
+      DBSubnetGroupName: !Ref DBSubnetGroup
+  DBSubnetGroup: 
+    Type: "AWS::RDS::DBSubnetGroup"
+    Properties: 
+      DBSubnetGroupDescription: description
+      SubnetIds: 
+        - !Ref ECSFargateSubnet1
+        - !Ref ECSFargateSubnet2  
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Join
+        - '-'
+        - - !Ref 'AWS::StackName'
+          - private-db-sg
+      GroupDescription: Allow postgres inbound traffic
+      VpcId: !Ref ECSFargateVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId:
+            !GetAtt ContainerSecurityGroup.GroupId 
+  ECSFargateVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 11.0.0.0/16
+      EnableDnsSupport: 'true'
+      EnableDnsHostnames: 'false'
+      InstanceTenancy: default
+  ECSFargateSubnet1:
+      DependsOn: AttachGateway
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId:
+          Ref: ECSFargateVPC
+        CidrBlock: 11.0.0.0/24
+        AvailabilityZone: "ap-southeast-2a"
+  ECSFargateSubnet2:
+      DependsOn: AttachGateway
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId:
+          Ref: ECSFargateVPC
+        CidrBlock: 11.0.1.0/24
+        AvailabilityZone: "ap-southeast-2b"
+  InternetGateway:
+    DependsOn: ECSFargateVPC
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+      - Key: Name
+        Value: ECS-multi-AZ
+  AttachGateway:
+    DependsOn: InternetGateway
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId:
+        Ref: ECSFargateVPC
+      InternetGatewayId:
+        Ref: InternetGateway
+  ECSFargateRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGateway
+    Properties:
+       RouteTableId:
+         Ref: ECSFargateRouteTable
+       DestinationCidrBlock: 0.0.0.0/0
+       GatewayId:
+         Ref: InternetGateway
+  ECSFargateRouteTable:
+    DependsOn: 
+      - ECSFargateSubnet2
+      - ECSFargateSubnet1
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:  
+        Ref: ECSFargateVPC
+  RouteTableAssociation1:
+    DependsOn: ECSFargateRouteTable
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId:
+        Ref: ECSFargateSubnet1
+      RouteTableId:
+        Ref: ECSFargateRouteTable
+  RouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId:
+        Ref: ECSFargateSubnet2
+      RouteTableId:
+        Ref: ECSFargateRouteTable
+Outputs:
+  LoadBalancerDNSName:
+    Description: The LoadBalancer DNS name
+    Value: !Join
+      - ''
+      - - 'http://'
+        - !GetAtt
+          - LoadBalancer
+          - DNSName
+    Export:
+      Name: !Sub "${AWS::StackName}-LoadBalancerDNSName"
+  ALBDNSName:
+    Description: ALB DNS Name
+    Value: !Join ['', [!Ref BackendSubdomain, ., !Ref HostedZoneName]]
+    Export:
+      Name: !Sub "${AWS::StackName}-ALBDNSName"
+  DBEndpoint:
+    Description: RDS endpoint
+    Value: 
+      !GetAtt
+      - DBInstance
+      - Endpoint.Address
+    Export:
+      Name: !Sub "${AWS::StackName}-RDSEndpoint"
+  DBDNSName:
+    Description: RDS DNS Name
+    Value: !Join ['', [!Ref RDSSubdomain, ., !Ref HostedZoneName]]
+    Export:
+      Name: !Sub "${AWS::StackName}-RDSDNSName"
